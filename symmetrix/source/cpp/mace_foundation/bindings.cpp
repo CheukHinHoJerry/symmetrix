@@ -212,7 +212,49 @@ PYBIND11_MODULE(_mace_foundation, m)
                                       energies ? e.mutable_data() : nullptr);
             }
             return py::make_tuple(energy, forces, virial, energies ? py::object(e) : py::none());
-        }, py::arg("x"), py::arg("numbers"), py::arg("cell"), py::arg("pbc"), py::arg("energies") = false);
+        }, py::arg("x"), py::arg("numbers"), py::arg("cell"), py::arg("pbc"), py::arg("energies") = false)
+        .def("compute_batch",
+             [](Evaluator& self, Array<double> x, Array<int> numbers, Array<int> i, Array<int> j, Array<double> shift,
+                py::object system, int num_systems, bool energies) {
+            const int n = int(numbers.size());
+            const long p = long(i.size());
+            if (x.size() != 3*n or j.size() != p or shift.size() != 3*p)
+                throw std::invalid_argument("expected x[n][3], numbers[n], i[p], j[p], shift[p][3]");
+            if (p > 2147483647L) throw std::invalid_argument("too many edges");
+            Array<int> s = system.is_none() ? Array<int>(n) : system.cast<Array<int>>();
+            if (system.is_none()) std::fill_n(s.mutable_data(), n, 0);
+            if (s.size() != n) throw std::invalid_argument("expected system[n]");
+            if (num_systems < 0) num_systems = n > 0 ? *std::max_element(s.data(), s.data() + n) + 1 : 0;
+            for (int a = 0; a < n; ++a)
+                if (s.data()[a] < 0 or s.data()[a] >= num_systems)
+                    throw std::invalid_argument("system[a] must be in [0, num_systems)");
+            // edges grouped by i (as from neighbor_list), within the systems
+            std::vector<int> first(n + 1, 0);
+            for (long q = 0; q < p; ++q) {
+                const int a = i.data()[q];
+                const int b = j.data()[q];
+                if (a < 0 or a >= n or b < 0 or b >= n) throw std::invalid_argument("i and j must be in [0, n)");
+                if (q > 0 and a < i.data()[q - 1]) throw std::invalid_argument("i must be in ascending order");
+                if (s.data()[a] != s.data()[b]) throw std::invalid_argument("an edge joins two systems");
+                ++first[a + 1];
+            }
+            for (int a = 0; a < n; ++a) first[a + 1] += first[a];
+            Array<double> energy(num_systems);
+            Array<double> forces({n, 3});
+            Array<double> virial({num_systems, 6});
+            Array<double> e(energies ? n : 0);
+            {
+                py::gil_scoped_release release;
+                self.compute_batch(n, x.data(), numbers.data(), first.data(), j.data(), shift.data(), num_systems,
+                                   s.data(), energy.mutable_data(), forces.mutable_data(), virial.mutable_data(),
+                                   energies ? e.mutable_data() : nullptr);
+            }
+            return py::make_tuple(energy, forces, virial, energies ? py::object(e) : py::none());
+        }, py::arg("x"), py::arg("numbers"), py::arg("i"), py::arg("j"), py::arg("shift"),
+           py::arg("system") = py::none(), py::arg("num_systems") = -1, py::arg("energies") = false,
+           "energies and virials (LAMMPS order) of the systems, forces and per-atom energies for the edges i -> j, "
+           "r_ij = x[j] - x[i] + shift, of a batch of structures (edges with r_ij >= r_cut are ignored)")
+        .def_property_readonly("r_cut", &Evaluator::r_cut);
 
     m.def("neighbor_list", [](Array<double> x, Array<double> cell, Array<bool> pbc, double cutoff) {
         const int n = int(x.size()/3);

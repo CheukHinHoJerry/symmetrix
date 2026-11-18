@@ -97,3 +97,30 @@ sums over the model's k-vectors, which is what PyTorch computes. The cell must b
 arguments set the values used when `atoms.info` has none. The GPU evaluator needs a build that found CUDA (Kokkos is not
 needed) and supports the tensor products of MACE-POLAR-1 only.
 `test/test_mace_polar.py` compares both with PyTorch for the model in `$SYMMETRIX_POLAR_MODEL`.
+
+#### Batches of structures (experimental)
+
+MACE is local, so many structures (any cells, sizes and periodicity) can be evaluated as one disconnected graph in a
+single call, with neighbor lists built one structure at a time and concatenated with offsets:
+```
+from symmetrix._mace_foundation import MACEFoundation, neighbor_list
+ev = MACEFoundation("model.json", device="cuda", dtype="float64")
+# per structure s with atoms offset o: p, q, S = neighbor_list(x_s, cell_s, pbc_s, ev.r_cut + skin)
+#   i = p + o, j = q + o, shift = S @ cell_s, system = s; i must stay in ascending order
+energy, forces, virial, energies = ev.compute_batch(x, numbers, i, j, shift, system, num_systems, energies=True)
+```
+for the edges `i -> j` with `r_ij = x[j] - x[i] + shift` (those with `r_ij >= ev.r_cut` are skipped, so a list built
+with a skin can be reused while atoms move by less than `skin/2`). It returns `energy[num_systems]`, `forces[n][3]`,
+`virial[num_systems][6]` (LAMMPS order xx yy zz xy xz yz) and per-atom energies; edges may not join two systems. The
+GPU evaluator uploads the edges again only when they change.
+[TorchSim](https://github.com/TorchSim/torch-sim) (`pip install torch-sim-atomistic`) can run batched dynamics with it:
+```
+import torch_sim as ts
+from symmetrix.torch_sim import SymmetrixMACEFoundationModel
+model = SymmetrixMACEFoundationModel("model.json", device="cuda", evaluator_dtype="float64", skin=1.0)
+state = ts.integrate(system=list_of_atoms, model=model, integrator=ts.Integrator.nvt_langevin, n_steps=1000,
+                     temperature=300.0, timestep=0.001)
+```
+which keeps a neighbor list per structure (rebuilt when its cell changes or an atom has moved by more than `skin/2`) and
+returns `energy`, `forces` and `stress` (`-virial/volume`, zero without a volume). Positions and results pass through
+host memory. `test/test_mace_foundation_batch.py` compares batches with `compute`, structure by structure.
