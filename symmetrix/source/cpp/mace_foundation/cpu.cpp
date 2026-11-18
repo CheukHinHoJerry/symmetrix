@@ -21,6 +21,12 @@ struct MACEFoundationCPU : Evaluator {
     MACEFoundationCPU(const std::string& file, double skin);
     double compute(int n, const double* x, const int* numbers, const double* cell, const bool* pbc,
                    double* forces, double* virial, double* energies) override;
+    void compute_batch(int n, const double* x, const int* numbers, const int* first, const int* neigh,
+                       const double* shift, int num_systems, const int* system, double* energy, double* forces,
+                       double* virial, double* energies) override;
+    double r_cut() const override { return mace.r_cut; }
+    void set_atoms(int n, const int* numbers);
+    template <class Displacement> void compute_graph(const int* first, const int* neigh, Displacement displacement);
     template <class Sh> void compute_node_energies_forces();
 
     MACEFoundation<Precision> mace;
@@ -30,6 +36,7 @@ struct MACEFoundationCPU : Evaluator {
     std::vector<int> numbers0;
     std::array<bool, 3> pbc0{};
     NeighborList nl;
+    std::vector<int> numbers_of_nodes;
 };
 
 template <class Precision>
@@ -39,75 +46,57 @@ skin(skin)
 }
 
 template <class Precision>
-double MACEFoundationCPU<Precision>::compute(int n, const double* x, const int* numbers,
-                                             const double* cell, const bool* pbc,
-                                         double* forces, double* virial, double* energies) {
-    std::fill(virial, virial + 6, 0.0);
-    if (n == 0) return 0;
-
+void MACEFoundationCPU<Precision>::set_atoms(int n, const int* numbers)
+{
     // nodes
-    bool rebuild = n != natoms or not std::equal(numbers, numbers + n, numbers0.begin()) or not std::equal(cell,
-            cell + 9, cell0.begin())
-                   or not std::equal(pbc, pbc + 3, pbc0.begin());
-    for (int i = 0; not rebuild and i < n; ++i) {
-        const double dx = x[3*i] - x0[3*i];
-        const double dy = x[3*i+1] - x0[3*i+1];
-        const double dz = x[3*i+2] - x0[3*i+2];
-        rebuild = 4*(dx*dx + dy*dy + dz*dz) > skin*skin;
+    const int T = mace.num_elements;
+    numbers_of_nodes.clear();
+    mace.elem_all.resize(n);
+    for (int i = 0; i < n; ++i) {
+        const auto it = std::find(mace.atomic_numbers.begin(), mace.atomic_numbers.end(), numbers[i]);
+        if (it == mace.atomic_numbers.end())
+            throw std::runtime_error("MACEFoundation: atomic number " + std::to_string(numbers[i])
+                                     + " is not an element of the model");
+        mace.elem_all[i] = int(it - mace.atomic_numbers.begin());
     }
-    if (rebuild) {
-        const int T = mace.num_elements;
-        natoms = -1;
-        mace.elem_all.resize(n);
-        for (int i = 0; i < n; ++i) {
-            const auto it = std::find(mace.atomic_numbers.begin(), mace.atomic_numbers.end(), numbers[i]);
-            if (it == mace.atomic_numbers.end())
-                throw std::runtime_error("MACEFoundation: atomic number " + std::to_string(numbers[i])
-                                         + " is not an element of the model");
-            mace.elem_all[i] = int(it - mace.atomic_numbers.begin());
-        }
-        neighbor_list(n, x, cell, pbc, mace.r_cut + skin, nl);
-        mace.atom_of_node.clear();
-        mace.segments.clear();
-        for (int t = 0; t < T; ++t) {
-            const int first = int(mace.atom_of_node.size());
-            for (int i = 0; i < n; ++i) if (mace.elem_all[i] == t) mace.atom_of_node.push_back(i);
-            if (int(mace.atom_of_node.size()) > first)
-                mace.segments.push_back({first, int(mace.atom_of_node.size()), t});
-        }
-        mace.N = n;
-        mace.NR = n;
-        mace.elem.resize(mace.N);
-        mace.row_of_atom.resize(n);
-        for (int k = 0; k < mace.N; ++k) {
-            mace.elem[k] = mace.elem_all[mace.atom_of_node[k]];
-            mace.row_of_atom[mace.atom_of_node[k]] = k;
-        }
-        mace.locks.reset(new std::atomic_flag[mace.N]);
-        natoms = n;
-        x0.assign(x, x + 3*(size_t)n);
-        cell0.assign(cell, cell + 9);
-        numbers0.assign(numbers, numbers + n);
-        pbc0 = {pbc[0], pbc[1], pbc[2]};
+    mace.atom_of_node.clear();
+    mace.segments.clear();
+    for (int t = 0; t < T; ++t) {
+        const int first = int(mace.atom_of_node.size());
+        for (int i = 0; i < n; ++i) if (mace.elem_all[i] == t) mace.atom_of_node.push_back(i);
+        if (int(mace.atom_of_node.size()) > first)
+            mace.segments.push_back({first, int(mace.atom_of_node.size()), t});
     }
+    mace.N = n;
+    mace.NR = n;
+    mace.elem.resize(mace.N);
+    mace.row_of_atom.resize(n);
+    for (int k = 0; k < mace.N; ++k) {
+        mace.elem[k] = mace.elem_all[mace.atom_of_node[k]];
+        mace.row_of_atom[mace.atom_of_node[k]] = k;
+    }
+    mace.locks.reset(new std::atomic_flag[mace.N]);
+    numbers_of_nodes.assign(numbers, numbers + n);
+}
 
+template <class Precision>
+template <class Displacement>
+void MACEFoundationCPU<Precision>::compute_graph(const int* first, const int* neigh, Displacement displacement)
+{
     // edges
     const int T = mace.num_elements;
     std::vector<int> cnt((long)mace.N*T, 0);
     bool short_pair = false;
     auto candidate = [&](int i, int c, double& dx, double& dy, double& dz) {
-        const int j = nl.j[c];
-        const int* s = nl.S.data() + 3*c;
-        dx = x[3*j] - x[3*i] + s[0]*cell[0] + s[1]*cell[3] + s[2]*cell[6];
-        dy = x[3*j+1] - x[3*i+1] + s[0]*cell[1] + s[1]*cell[4] + s[2]*cell[7];
-        dz = x[3*j+2] - x[3*i+2] + s[0]*cell[2] + s[1]*cell[5] + s[2]*cell[8];
+        const int j = neigh[c];
+        displacement(i, j, c, dx, dy, dz);
         return j;
     };
     const double r_cut2 = mace.r_cut*mace.r_cut;
 #pragma omp parallel for schedule(static)
     for (int nn = 0; nn < mace.N; ++nn) {
         const int i = mace.atom_of_node[nn];
-        for (int c = nl.start[i]; c < nl.start[i + 1]; ++c) {
+        for (int c = first[i]; c < first[i + 1]; ++c) {
             double dx;
             double dy;
             double dz;
@@ -139,7 +128,7 @@ double MACEFoundationCPU<Precision>::compute(int n, const double* x, const int* 
         const int i = mace.atom_of_node[nn];
         const int a = mace.elem[nn];
         for (int b = 0; b < T; ++b) off[b] = mace.seg[(long)nn*(T + 1) + b];
-        for (int c = nl.start[i]; c < nl.start[i + 1]; ++c) {
+        for (int c = first[i]; c < first[i + 1]; ++c) {
             double dx;
             double dy;
             double dz;
@@ -165,6 +154,42 @@ double MACEFoundationCPU<Precision>::compute(int n, const double* x, const int* 
 
     with_preset(mace.num_channels, mace.L_max, mace.num_channels_node, [&](auto s) {
         this->template compute_node_energies_forces<decltype(s)>();
+    });
+}
+
+template <class Precision>
+double MACEFoundationCPU<Precision>::compute(int n, const double* x, const int* numbers,
+                                             const double* cell, const bool* pbc,
+                                         double* forces, double* virial, double* energies) {
+    std::fill(virial, virial + 6, 0.0);
+    if (n == 0) return 0;
+
+    // nodes
+    bool rebuild = n != natoms or not std::equal(numbers, numbers + n, numbers0.begin()) or not std::equal(cell,
+            cell + 9, cell0.begin())
+                   or not std::equal(pbc, pbc + 3, pbc0.begin());
+    for (int i = 0; not rebuild and i < n; ++i) {
+        const double dx = x[3*i] - x0[3*i];
+        const double dy = x[3*i+1] - x0[3*i+1];
+        const double dz = x[3*i+2] - x0[3*i+2];
+        rebuild = 4*(dx*dx + dy*dy + dz*dz) > skin*skin;
+    }
+    if (rebuild) {
+        natoms = -1;
+        set_atoms(n, numbers);
+        neighbor_list(n, x, cell, pbc, mace.r_cut + skin, nl);
+        natoms = n;
+        x0.assign(x, x + 3*(size_t)n);
+        cell0.assign(cell, cell + 9);
+        numbers0.assign(numbers, numbers + n);
+        pbc0 = {pbc[0], pbc[1], pbc[2]};
+    }
+
+    compute_graph(nl.start.data(), nl.j.data(), [&](int i, int j, int c, double& dx, double& dy, double& dz) {
+        const int* s = nl.S.data() + 3*c;
+        dx = x[3*j] - x[3*i] + s[0]*cell[0] + s[1]*cell[3] + s[2]*cell[6];
+        dy = x[3*j+1] - x[3*i+1] + s[0]*cell[1] + s[1]*cell[4] + s[2]*cell[7];
+        dz = x[3*j+2] - x[3*i+2] + s[0]*cell[2] + s[1]*cell[5] + s[2]*cell[8];
     });
 
     // forces
@@ -199,6 +224,57 @@ double MACEFoundationCPU<Precision>::compute(int n, const double* x, const int* 
     }
     std::copy(vir, vir + 6, virial);
     return energy;
+}
+
+template <class Precision>
+void MACEFoundationCPU<Precision>::compute_batch(int n, const double* x, const int* numbers, const int* first,
+                                                 const int* neigh, const double* shift, int num_systems,
+                                                 const int* system, double* energy, double* forces, double* virial,
+                                                 double* energies)
+{
+    std::fill(energy, energy + num_systems, 0.0);
+    std::fill(virial, virial + 6*(long)num_systems, 0.0);
+    std::fill(forces, forces + 3*(long)n, 0.0);
+    if (n == 0) return;
+
+    // nodes, edges (compute builds its neighbor list again after this)
+    natoms = -1;
+    if (n != int(numbers_of_nodes.size()) or not std::equal(numbers, numbers + n, numbers_of_nodes.begin()))
+        set_atoms(n, numbers);
+    compute_graph(first, neigh, [&](int i, int j, int c, double& dx, double& dy, double& dz) {
+        dx = x[3*j] - x[3*i] + shift[3*c];
+        dy = x[3*j+1] - x[3*i+1] + shift[3*c+1];
+        dz = x[3*j+2] - x[3*i+2] + shift[3*c+2];
+    });
+
+    // forces, and energies and virials of the systems
+    for (int nn = 0; nn < mace.N; ++nn) {
+        const int i = mace.atom_of_node[nn];
+        double* vir = virial + 6*(long)system[i];
+        energy[system[i]] += mace.node_energies[nn];
+        if (energies) energies[i] = mace.node_energies[nn];
+        for (int e = mace.start[nn]; e < mace.start[nn + 1]; ++e) {
+            const int j = mace.neigh_indices[e];
+            const double f0 = mace.edge_forces[3*e];
+            const double f1 = mace.edge_forces[3*e+1];
+            const double f2 = mace.edge_forces[3*e+2];
+            forces[3*j] += f0;
+            forces[3*j+1] += f1;
+            forces[3*j+2] += f2;
+            forces[3*i] -= f0;
+            forces[3*i+1] -= f1;
+            forces[3*i+2] -= f2;
+            const double dx = double(mace.geometry[4*e+1])*mace.geometry[4*e+3];
+            const double dy = double(mace.geometry[4*e+2])*mace.geometry[4*e+3];
+            const double dz = double(mace.geometry[4*e])*mace.geometry[4*e+3];
+            vir[0] += dx*f0;
+            vir[1] += dy*f1;
+            vir[2] += dz*f2;
+            vir[3] += 0.5*(dx*f1 + dy*f0);
+            vir[4] += 0.5*(dx*f2 + dz*f0);
+            vir[5] += 0.5*(dy*f2 + dz*f1);
+        }
+    }
 }
 
 template <class Precision>
